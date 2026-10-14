@@ -23,8 +23,8 @@ Measured on a RedMagic 10S Pro (Snapdragon 8 Elite, 24 GB RAM, 1 TB UFS):
   their own license. You need the Qwen3.8-Flash-Next GGUF split into the two shards the app
   expects (`...-00001-of-00002.gguf`, `...-00002-of-00002.gguf`) in the custom mixed quant the app
   documents, plus matching SHA-256 entries in `ModelCatalog.kt`.
-- To build: Android SDK, NDK 28.x, CMake 3.31+, a checkout of llama.cpp at the revision named in
-  `patches/`, and the patch applied.
+- To build: Android SDK, NDK 28.x, CMake 3.31+, and a clean llama.cpp checkout **at revision
+  `1b70350`** with `patches/llama.cpp-moedroid.patch` applied (see `patches/README.md`).
 
 ## How it works
 
