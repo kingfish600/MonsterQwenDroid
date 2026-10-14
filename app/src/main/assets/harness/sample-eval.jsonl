@@ -1,0 +1,8 @@
+// BonsaiDroid eval suite v0 — greedy decoding sanity checks.
+// Run from the Harness tab; expectContains does case-insensitive substring match.
+{"id":"arith-1","messages":[{"role":"user","content":"What is 17*23? Answer with just the number."}],"expectContains":["391"],"maxTokens":64}
+{"id":"arith-2","messages":[{"role":"user","content":"What is 1024/8? Answer with just the number."}],"expectContains":["128"],"maxTokens":64}
+{"id":"code-1","messages":[{"role":"user","content":"Write a Python function that reverses a string. Include the word 'def'."}],"expectContains":["def"],"maxTokens":256}
+{"id":"reason-1","messages":[{"role":"user","content":"Alice has 3 brothers and 2 sisters. How many sisters does Alice's brother have? Think step by step, then answer with a number."}],"expectContains":["3"],"maxTokens":512}
+{"id":"knowledge-1","messages":[{"role":"user","content":"What quantization format are your weights stored in? One short sentence."}],"expectContains":["ternary","2-bit","two-bit","quant"],"maxTokens":128}
+{"id":"lang-1","messages":[{"role":"user","content":"Translate to French: The cat sits on the mat."}],"expectContains":["chat"],"maxTokens":128}

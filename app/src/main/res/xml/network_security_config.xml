@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Loopback-only cleartext exception.
+
+  The bundled llama-server speaks plain HTTP over 127.0.0.1 (subprocess IPC,
+  not a security boundary — the traffic never leaves the device). Android 9+
+  blocks cleartext by default, which made OkHttp refuse every localhost call
+  ("CLEARTEXT communication to 127.0.0.1 not permitted"). Everything else
+  (Hugging Face downloads etc.) remains HTTPS-enforced.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <!--
+          The results drop server, on the tailnet. Without this the sweep's
+          self-upload is blocked by the base-config cleartextTrafficPermitted=false
+          and fails silently (it is wrapped in runCatching), so the measurement
+          would never arrive. MagicDNS name rather than the raw IP because
+          <domain> matches hostnames.
+        -->
+        <domain includeSubdomains="true">tony-aimax395.tail5f69b1.ts.net</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,17 @@
+# build output and binaries are not committed
+build/
+.gradle/
+.cxx/
+*.apk
+*.aab
+*.so
+*.gguf
+*.part
+jniLibs/
+local.properties
+.idea/
+*.iml
+__pycache__/
+*.pyc
+build-*.log
+*.log

@@ -1,0 +1,620 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef..b368963 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -601,6 +601,8 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_MOE_SUM,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1060,6 +1062,11 @@ extern "C" {
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a);
+ 
++    // sum the n_expert_used axis: [n_embd, n_expert, n_tokens] -> [n_embd, n_tokens]
++    GGML_API struct ggml_tensor * ggml_moe_sum(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a);
++
+     GGML_API struct ggml_tensor * ggml_cumsum(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a);
+diff --git a/ggml/src/ggml-cpu/arch/arm/quants.c b/ggml/src/ggml-cpu/arch/arm/quants.c
+index cfbbf66..a120bb5 100644
+--- a/ggml/src/ggml-cpu/arch/arm/quants.c
++++ b/ggml/src/ggml-cpu/arch/arm/quants.c
+@@ -248,44 +248,60 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     const uint8x16_t mask2   = vdupq_n_u8(0x03);
+     const int8x16_t  one     = vdupq_n_s8(1);
+ 
+-    float32x4_t sumv = vdupq_n_f32(0.0f);
+-
+-    for (int i = 0; i < nb; i++) {
+-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+-
+-        // group 64: one Q2_0 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64)
+-        for (int k = 0; k < 2; k++) {
+-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+-
+-            // Load 8 bytes of packed 2-bit values
+-            const uint8x8_t raw = vld1_u8(&x[i].qs[k * 8]);
+-            const uint8x16_t raw16 = vcombine_u8(raw, raw);
+-
+-            // First 16 elements: replicate bytes 0-3, shift, mask, subtract 1
+-            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo);
+-            int8x16_t qv0 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
+-                one);
+-
+-            // Second 16 elements: replicate bytes 4-7, shift, mask, subtract 1
+-            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi);
+-            int8x16_t qv1 = vsubq_s8(
+-                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
+-                one);
+-
+-            // Load Q8_0 values and dot product
+-            const int8x16_t y0 = vld1q_s8(yb->qs);
+-            const int8x16_t y1 = vld1q_s8(yb->qs + 16);
++    // Two accumulators. Measured on Snapdragon 8 Elite with q2_0_bench: the
++    // single-accumulator form is latency-bound on the vcvtq_f32_s32 ->
++    // vmlaq_n_f32 chain (one per 32 weights), and an independent second
++    // accumulator takes the kernel from 6.2 to 9.4 Mrow/s (1.52x). Set
++    // BONSAI_Q20_UNROLL=0 for the original single-accumulator kernel.
++    static int q20_unroll = -1;
++    if (q20_unroll < 0) {
++        const char * e = getenv("BONSAI_Q20_UNROLL");
++        q20_unroll = e ? atoi(e) : 1;
++    }
+ 
+-            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), qv0, y0);
+-            int32x4_t p1 = ggml_vdotq_s32(p0, qv1, y1);
++#define Q2_0_BLOCK(IDX, ACC) \
++    do { \
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[(IDX)].d); \
++        for (int k = 0; k < 2; k++) { \
++            const block_q8_0 * GGML_RESTRICT yb = &y[(IDX) * 2 + k]; \
++            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d); \
++            const uint8x8_t raw = vld1_u8(&x[(IDX)].qs[k * 8]); \
++            const uint8x16_t raw16 = vcombine_u8(raw, raw); \
++            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo); \
++            int8x16_t qv0 = vsubq_s8( \
++                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)), one); \
++            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi); \
++            int8x16_t qv1 = vsubq_s8( \
++                vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)), one); \
++            const int8x16_t y0 = vld1q_s8(yb->qs); \
++            const int8x16_t y1 = vld1q_s8(yb->qs + 16); \
++            int32x4_t p0 = ggml_vdotq_s32(vdupq_n_s32(0), qv0, y0); \
++            int32x4_t p1 = ggml_vdotq_s32(p0, qv1, y1); \
++            (ACC) = vmlaq_n_f32((ACC), vcvtq_f32_s32(p1), d0 * d1); \
++        } \
++    } while (0)
++
++    if (q20_unroll) {
++        float32x4_t sumv0 = vdupq_n_f32(0.0f);
++        float32x4_t sumv1 = vdupq_n_f32(0.0f);
+ 
+-            sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p1), d0 * d1);
++        int i = 0;
++        for (; i + 1 < nb; i += 2) {
++            Q2_0_BLOCK(i,     sumv0);
++            Q2_0_BLOCK(i + 1, sumv1);
++        }
++        for (; i < nb; ++i) {
++            Q2_0_BLOCK(i, sumv0);
+         }
++        sumf = vaddvq_f32(vaddq_f32(sumv0, sumv1));
++    } else {
++        float32x4_t sumv = vdupq_n_f32(0.0f);
++        for (int i = 0; i < nb; ++i) {
++            Q2_0_BLOCK(i, sumv);
++        }
++        sumf = vaddvq_f32(sumv);
+     }
+-
+-    sumf = vaddvq_f32(sumv);
++#undef Q2_0_BLOCK
+ #else
+     ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+     return;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 5428d51..601396f 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -20,6 +20,7 @@
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+ #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
+ #include <alloca.h>
++#include <sys/mman.h>
+ #endif
+ 
+ #include <assert.h>
+@@ -1551,6 +1552,91 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+     return ptr;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// Expert-slice prefetch for mmap'd MoE weights (BONSAI_MOE_PREFETCH).
++//
++// Expert weights live in a memory-mapped file, and a demand fault reads on the
++// order of a page. A token that routes through ~663 MB of expert slices can
++// therefore pay tens of thousands of small reads. Issuing WILLNEED for a whole
++// slice (460 KB here) turns that into one large read, and issuing it from the
++// *previous* matmul of the same layer hides the latency behind compute.
++//
++// Sibling tensors are found by tensor name, so nothing has to be plumbed
++// through llama.cpp. Values:
++//   0 (default) off
++//   1           from the gate prefetch the up projection (next op only)
++//   2           from the gate prefetch both up and down
++// ---------------------------------------------------------------------------
++#define BONSAI_MOE_MAX_LAYER 128
++
++static int g_moe_pf_mode = -1;                  // -1 = not read yet
++static const struct ggml_tensor * g_moe_gate[BONSAI_MOE_MAX_LAYER];
++static const struct ggml_tensor * g_moe_up  [BONSAI_MOE_MAX_LAYER];
++static const struct ggml_tensor * g_moe_down[BONSAI_MOE_MAX_LAYER];
++static atomic_long g_moe_pf_hints;
++
++static void moe_pf_report(void) {
++    const long n = atomic_load(&g_moe_pf_hints);
++    if (n > 0) {
++        fprintf(stderr, "BONSAI_MOE_PREFETCH: %ld expert-slice hints issued\n", n);
++    }
++}
++
++static int moe_pf_mode(void) {
++    if (g_moe_pf_mode < 0) {
++        const char * e = getenv("BONSAI_MOE_PREFETCH");
++        g_moe_pf_mode = e ? atoi(e) : 0;
++        if (g_moe_pf_mode > 0) {
++            atexit(moe_pf_report);   // so "does it actually fire" is observable
++        }
++    }
++    return g_moe_pf_mode;
++}
++
++// "blk.<N>.ffn_{gate,up,down}_exps.weight" -> kind 1/2/3, else 0
++static int moe_layer_kind(const char * name, int * layer) {
++    if (name == NULL) return 0;
++    const char * p = strstr(name, "blk.");
++    if (p == NULL) return 0;
++    int n = -1;
++    if (sscanf(p, "blk.%d.", &n) != 1) return 0;
++    if (n < 0 || n >= BONSAI_MOE_MAX_LAYER) return 0;
++    *layer = n;
++    if (strstr(p, "ffn_gate_exps") != NULL) return 1;
++    if (strstr(p, "ffn_up_exps")   != NULL) return 2;
++    if (strstr(p, "ffn_down_exps") != NULL) return 3;
++    return 0;
++}
++
++static void moe_pf_register(const struct ggml_tensor * t, int layer, int kind) {
++    switch (kind) {
++        case 1: g_moe_gate[layer] = t; break;
++        case 2: g_moe_up  [layer] = t; break;
++        case 3: g_moe_down[layer] = t; break;
++    }
++}
++
++static void moe_pf_hint(const struct ggml_tensor * t, const int64_t * counts, int64_t n_as) {
++    if (t == NULL || t->data == NULL) return;
++    const size_t slice = (size_t) t->nb[2];
++    if (slice == 0) return;
++    // posix_madvise rejects unaligned addresses (EINVAL), and an expert slice
++    // (460800 B) is not a multiple of the page size, so round the range out to
++    // whole pages. Without this the hint silently does nothing.
++    const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t mask = pg - 1;
++    for (int64_t a = 0; a < n_as; ++a) {
++        if (counts[a] == 0) continue;
++        const uintptr_t base = (uintptr_t) t->data + (uintptr_t) a * slice;
++        const uintptr_t lo = base & ~mask;
++        const uintptr_t hi = (base + slice + mask) & ~mask;
++        if (posix_madvise((void *) lo, (size_t) (hi - lo), POSIX_MADV_WILLNEED) == 0) {
++            atomic_fetch_add(&g_moe_pf_hints, 1);
++        }
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1658,6 +1744,22 @@ static void ggml_compute_forward_mul_mat_id(
+                 matrix_row_counts[i02] += 1;
+             }
+         }
++
++        if (moe_pf_mode() > 0) {
++            int layer = -1;
++            const int kind = moe_layer_kind(src0->name, &layer);
++            if (kind != 0) {
++                moe_pf_register(src0, layer, kind);
++                if (kind == 1) {
++                    moe_pf_hint(g_moe_up[layer], matrix_row_counts, n_as);
++                    if (moe_pf_mode() >= 2) {
++                        moe_pf_hint(g_moe_down[layer], matrix_row_counts, n_as);
++                    }
++                } else if (kind == 2) {
++                    moe_pf_hint(g_moe_down[layer], matrix_row_counts, n_as);
++                }
++            }
++        }
+     }
+ 
+     // reset current_chunk
+@@ -1810,6 +1912,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_sum_rows(params, tensor);
+             } break;
++        case GGML_OP_MOE_SUM:
++            {
++                ggml_compute_forward_moe_sum(params, tensor);
++            } break;
+         case GGML_OP_CUMSUM:
+             {
+                 ggml_compute_forward_cumsum(params, tensor);
+@@ -2282,6 +2388,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = 1;
+             } break;
++        case GGML_OP_MOE_SUM:
++            {
++                n_tasks = n_threads;   // row-parallel over n_embd x n_tokens
++            } break;
+         case GGML_OP_COUNT_EQUAL:
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_GATED_DELTA_NET:
+@@ -3098,6 +3208,39 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++// --- diag: per-op CPU timing (BONSAI_PROF) ---
++#ifndef BONSAI_PROF
++#define BONSAI_PROF 0
++#endif
++#if BONSAI_PROF
++#include <time.h>
++static uint64_t g_prof_op_ns[GGML_OP_COUNT];
++static uint64_t g_prof_op_calls[GGML_OP_COUNT];
++static uint64_t g_prof_type_ns[GGML_TYPE_COUNT];
++static uint64_t g_prof_graphs;
++static inline uint64_t g_prof_now(void) {
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
++}
++static void g_prof_dump(void) {
++    fprintf(stderr, "\n=== CPU OP PROFILE after %llu graphs ===\n", (unsigned long long) g_prof_graphs);
++    for (int op = 0; op < GGML_OP_COUNT; ++op) {
++        if (!g_prof_op_calls[op]) continue;
++        fprintf(stderr, "  %-22s %9.2f ms total %8.3f ms/graph %9llu calls\n",
++            ggml_op_name((enum ggml_op) op),
++            g_prof_op_ns[op] / 1e6, g_prof_op_ns[op] / 1e6 / (double) g_prof_graphs,
++            (unsigned long long) g_prof_op_calls[op]);
++    }
++    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
++        if (!g_prof_type_ns[t]) continue;
++        fprintf(stderr, "  MATMUL %-14s %9.2f ms total %8.3f ms/graph\n",
++            ggml_type_name((enum ggml_type) t),
++            g_prof_type_ns[t] / 1e6, g_prof_type_ns[t] / 1e6 / (double) g_prof_graphs);
++    }
++    fflush(stderr);
++}
++#endif
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3138,6 +3281,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++#if BONSAI_PROF
++        const uint64_t prof_t0 = (state->ith == 0) ? g_prof_now() : 0;
++#endif
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3156,8 +3302,43 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++#if BONSAI_PROF
++        if (state->ith == 0) {
++            const uint64_t prof_dt = g_prof_now() - prof_t0;
++            g_prof_op_ns[node->op] += prof_dt;
++            g_prof_op_calls[node->op] += 1;
++            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
++                const enum ggml_type tt = node->src[0]->type;
++                if ((int) tt >= 0 && (int) tt < GGML_TYPE_COUNT) {
++                    g_prof_type_ns[tt] += prof_dt;
++                }
++            }
++        }
++#endif
+     }
+ 
++#if BONSAI_PROF
++    // BONSAI_PROF_EVERY=1 makes every graph dump, so consecutive dumps can be
++    // differenced to get one decode token's op times (the default interval of 8
++    // mixes the prefill graph into the average and hides the real budget).
++    if (state->ith == 0) {
++        static long prof_every = -1;
++        if (prof_every < 0) {
++            const char * e = getenv("BONSAI_PROF_EVERY");
++            prof_every = e ? atol(e) : 8;
++            if (prof_every < 1) prof_every = 8;
++        }
++        if ((++g_prof_graphs % (uint64_t) prof_every) != 0) {
++            goto prof_skip_dump;
++        }
++    } else {
++        goto prof_skip_dump;
++    }
++    {
++        g_prof_dump();
++    }
++prof_skip_dump: ;
++#endif
+ #ifdef GGML_USE_OPENMP
+     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
+ #else
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index c7e7c47..d39160a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -1455,6 +1455,65 @@ void ggml_compute_forward_cumsum(
+     }
+ }
+ 
++// ggml_compute_forward_moe_sum
++//
++// Sums the expert axis of [n_embd, n_expert_used, n_tokens] in a single pass.
++// build_moe_ffn used to emit a view per expert plus a chain of n_expert_used-1
++// adds: top-10 routing meant 10 views + 9 adds per layer, ~912 nodes per token,
++// about a third of the decode graph, each re-reading and re-writing a 2560-float
++// accumulator. Accumulation order is preserved so results stay bit-identical.
++static void ggml_compute_forward_moe_sum_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++
++    GGML_ASSERT(src0->type  == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
++    GGML_ASSERT(src0->nb[0] == sizeof(float));
++    GGML_ASSERT(dst->nb[0]  == sizeof(float));
++    GGML_ASSERT(dst->ne[0]  == src0->ne[0]);
++    GGML_ASSERT(dst->ne[1]  == src0->ne[2]);
++    GGML_ASSERT(src0->ne[3] == 1);
++
++    const int64_t ne0   = dst->ne[0];
++    const int64_t ne1   = dst->ne[1];
++    const int64_t n_exp = src0->ne[1];
++
++    const char * src = (const char *) src0->data;
++    char       * out = (char       *) dst->data;
++
++    const int64_t total = ne0*ne1;
++    for (int64_t idx = params->ith; idx < total; idx += params->nth) {
++        const int64_t e = idx % ne0;
++        const int64_t t = idx / ne0;
++
++        const char * base = src + t*src0->nb[2] + e*sizeof(float);
++
++        float acc = 0.0f;
++        for (int64_t i = 0; i < n_exp; ++i) {
++            acc += *(const float *) (base + i*src0->nb[1]);
++        }
++        *(float *) (out + t*dst->nb[1] + e*sizeof(float)) = acc;
++    }
++}
++
++void ggml_compute_forward_moe_sum(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_moe_sum_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_sum_rows
+ 
+ static void ggml_compute_forward_sum_rows_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08..0a5a830 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -33,6 +33,7 @@ void ggml_compute_forward_add1(const struct ggml_compute_params * params, struct
+ void ggml_compute_forward_acc(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_sum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_sum_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_moe_sum (const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_cumsum(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_mean(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_argmax(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cpu/vec.cpp b/ggml/src/ggml-cpu/vec.cpp
+index 3918a6f..f6e9f33 100644
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -145,6 +145,45 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t *
+     int i = 0;
+     ggml_float sumf = 0;
+ 
++#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
++    // Hardware BF16 dot: one instruction per 8 pairs, no unpacking. Needs
++    // -march=...+bf16 and a CPU with FEAT_BF16 (probe before shipping this).
++    {
++        float32x4_t bf_lo = vdupq_n_f32(0.0f);
++        float32x4_t bf_hi = vdupq_n_f32(0.0f);
++        const bfloat16_t * x_b = (const bfloat16_t *) x;
++        const bfloat16_t * y_b = (const bfloat16_t *) y;
++        for (; i + 15 < n; i += 16) {
++            bf_lo = vbfdotq_f32(bf_lo, vld1q_bf16(x_b + i),     vld1q_bf16(y_b + i));
++            bf_hi = vbfdotq_f32(bf_hi, vld1q_bf16(x_b + i + 8), vld1q_bf16(y_b + i + 8));
++        }
++        for (; i + 7 < n; i += 8) {
++            bf_lo = vbfdotq_f32(bf_lo, vld1q_bf16(x_b + i), vld1q_bf16(y_b + i));
++        }
++        sumf += (ggml_float) vaddvq_f32(vaddq_f32(bf_lo, bf_hi));
++    }
++#elif defined(__ARM_NEON) && !defined(BONSAI_NO_BF16_NEON)
++    // BF16 -> F32 is an exact 16-bit left shift (BF16 is the top half of F32),
++    // so this needs neither +bf16 nor any conversion of the operand vectors.
++    {
++        float32x4_t sum_lo = vdupq_n_f32(0.0f);
++        float32x4_t sum_hi = vdupq_n_f32(0.0f);
++        const uint16_t * x_u16 = (const uint16_t *) x;
++        const uint16_t * y_u16 = (const uint16_t *) y;
++        for (; i + 7 < n; i += 8) {
++            const uint16x8_t vx = vld1q_u16(x_u16 + i);
++            const uint16x8_t vy = vld1q_u16(y_u16 + i);
++            const float32x4_t x0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(vx),  16));
++            const float32x4_t x1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(vx), 16));
++            const float32x4_t y0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(vy),  16));
++            const float32x4_t y1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(vy), 16));
++            sum_lo = vfmaq_f32(sum_lo, x0, y0);
++            sum_hi = vfmaq_f32(sum_hi, x1, y1);
++        }
++        sumf += (ggml_float) vaddvq_f32(vaddq_f32(sum_lo, sum_hi));
++    }
++#endif
++
+ #if defined(__AVX512BF16__)
+     __m512 c1 = _mm512_setzero_ps();
+     __m512 c2 = _mm512_setzero_ps();
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index ef0134b..daa5892 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1110,9 +1110,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "MOE_SUM",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1225,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "moe_sum(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -2508,6 +2512,19 @@ struct ggml_tensor * ggml_sum(
+ 
+ // ggml_sum_rows
+ 
++struct ggml_tensor * ggml_moe_sum(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a) {
++    GGML_ASSERT(a->ne[3] == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], a->ne[2]);
++
++    result->op     = GGML_OP_MOE_SUM;
++    result->src[0] = a;
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_sum_rows(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index f69fe63..2372cad 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2145,6 +2145,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * selected_experts_in) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
++
++    // Optional expert-count cap (BONSAI_MOE_TOPK, off unless set).
++    // Measured on device: the routed-expert matmuls (MUL_MAT_ID, Q2_0) are 79% of
++    // matmul time while their bytes are only ~11% of per-token traffic - the
++    // expert path sustains ~3 GB/s against ~40 GB/s for the dense stream, because
++    // each of the 144 ops gathers 10 scattered 460 KB slices and re-quantises
++    // src1 ten times. Touching fewer experts attacks the dominant cost directly.
++    // Quality is the tradeoff, so it is opt-in. The norm_w path renormalises the
++    // remaining weights, so the output scale stays correct.
++    static const int64_t moe_topk = []() -> int64_t {
++        const char * e = getenv("BONSAI_MOE_TOPK");
++        const long v = e ? atol(e) : 0;
++        return v > 0 ? (int64_t) v : 0;
++    }();
++    if (moe_topk > 0 && moe_topk < n_expert_used) {
++        n_expert_used = moe_topk;
++    }
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+ 
+     ggml_tensor * logits = nullptr;
+@@ -2455,34 +2472,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     ggml_build_forward_expand(gf, experts);
+ 
+-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+-
+     assert(n_expert_used > 0);
+ 
+-    // order the views before the adds
+-    // Use per-layer n_expert_used to bound the graph even during warmup (avoids
+-    // the large-add-nodes issue for uniform arches; for Puzzle the per-layer
+-    // value is correct). ref: https://github.com/ggml-org/llama.cpp/pull/14753
+-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+-
+-        ggml_build_forward_expand(gf, cur_experts[i]);
+-    }
++    // Aggregate the experts in one pass. The previous form emitted a view per
++    // expert plus a chain of n_expert_used-1 adds: top-10 routing meant 10 views
++    // and 9 adds per layer, ~912 nodes per token, roughly a third of the decode
++    // graph, each re-reading and re-writing a 2560-float accumulator.
++    // ggml_moe_sum preserves accumulation order (bit-identical result) and
++    // returns a contiguous tensor, so no ggml_cont is needed for n_expert_used==1.
++    ggml_tensor * moe_out = ggml_moe_sum(ctx0, experts);
+ 
+-    // aggregate experts
+-    ggml_tensor * moe_out = cur_experts[0];
+-
+-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+-
+-        ggml_build_forward_expand(gf, moe_out);
+-    }
+-
+-    if (n_expert_used_il == 1) {
+-        // avoid returning a non-contiguous tensor
+-        moe_out = ggml_cont(ctx0, moe_out);
+-    }
++    cb(moe_out, "ffn_moe_sum", il);
+ 
+     cb(moe_out, "ffn_moe_out", il);
+ 

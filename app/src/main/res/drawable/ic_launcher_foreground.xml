@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple bonsai-in-a-chip vector mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M54,24 C40,24 30,34 30,46 C30,56 38,64 48,65 L48,74 L40,84 L44,84 L52,75 L60,84 L64,84 L56,74 L56,65 C66,64 78,56 78,46 C78,34 68,24 54,24 Z M54,30 C62,30 70,37 70,45 C70,53 62,59 54,59 C46,59 38,53 38,45 C38,37 46,30 54,30 Z" />
+</vector>
