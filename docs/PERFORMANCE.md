@@ -60,6 +60,33 @@ main open problem; see below.
 - **Expert-slice prefetch (`POSIX_MADV_WILLNEED`):** implemented and verified (hints fire,
   bit-identical output), neutral — and the fault measurements say why: the expert path is not
   storage-bound (~1 MB/token of major faults against 664 MB of slices).
+- **File-backed transparent huge pages (`MADV_HUGEPAGE`, `BONSAI_THP=1`):** rejected, and
+  harmful. The idea was to multiply TLB reach for the expert path (2 MB pages instead of
+  4 KB). Measured mirrored, off/on/on/off, decode-only, under one identical cap profile
+  (cpu0 3532800, cpu6 3840000):
+
+  | arm | `BONSAI_THP` | FilePmdMapped | AnonHugePages | Rss | decode t/s | majflt |
+  |---|---|---|---|---|---|---|
+  | t1off | 0 | 0 kB | 2 MB | 17.3 GB | **4.66** | 90,373 |
+  | t2on | 1 | **0 kB** | 6 MB | 10.4 GB | 2.66 | 131,334 |
+  | t3on | 1 | **0 kB** | 28 MB | 8.9 GB | 2.41 | 137,866 |
+  | t4off | 0 | 0 kB | 6 MB | 17.1 GB | **4.53** | 90,398 |
+
+  `MADV_HUGEPAGE` on the read-only weight mapping is **inert for translation** (f2fs on 6.6 never
+  calls `mapping_set_large_folios()`, so no PMD mappings can form) but **harmful via reclaim**: it
+  changed the VMA's reclaim behaviour and evicted the expert working set. That is why decode falls
+  ~45% and Rss drops from ~17 GB to ~9-10 GB.
+
+  This is the first measured case of a hint *intended to help* pushing a working set over the
+  page-cache cliff — the same non-linear signature as the MTP sidecar and Q4_0 experts, by a
+  different mechanism.
+
+  **Rule: judge any mapping hint on `FilePmdMapped` / `AnonHugePages` first, never on t/s alone.**
+  t/s alone would have said "THP hurts performance", which is wrong and useless.
+
+  The live version of the idea is anonymous THP for the dense backbone, and it has to wait until
+  the BF16 -> Q8_0 rewrite shrinks the dense side, because that RAM comes out of the same page
+  cache holding the expert working set.
 
 ## Where the remaining headroom is
 

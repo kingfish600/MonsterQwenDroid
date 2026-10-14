@@ -11,7 +11,7 @@ Measured on a RedMagic 10S Pro (Snapdragon 8 Elite, 24 GB RAM, 1 TB UFS):
 | | |
 |---|---:|
 | Decode | **4.4 t/s** at full quality |
-| Prefill | ~2.9 t/s |
+| Prefill | **~7.3-8.6 t/s** on a 966-token prompt |
 | Weights | 66.4 GB, 2 shards, demand-paged from UFS |
 | RAM to fit | 24 GB phone; ~15.5 GB page cache holds the hot expert working set |
 

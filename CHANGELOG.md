@@ -7,7 +7,7 @@ top-10 routed, ~6B active per token) entirely on-device on a Snapdragon 8 Elite
 phone, CPU only, from a 66 GB mixed-quant GGUF.
 
 Measured on a RedMagic 10S Pro (24 GB, 1 TB): **4.4 t/s decode at full quality**,
-~2.9 t/s prefill, model loaded and streaming from storage.
+**~7.3-8.6 t/s prefill on a 966-token prompt**, model loaded and streaming from storage.
 
 Engine work on top of stock llama.cpp:
 
